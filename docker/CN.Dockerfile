@@ -1,31 +1,48 @@
+# Build stage
 FROM python:3.12-slim AS builder
 
-RUN echo "Types: deb\n\
-URIs: https://mirrors.tuna.tsinghua.edu.cn/debian\n\
-Suites: bookworm bookworm-updates bookworm-backports\n\
-Components: main contrib non-free non-free-firmware\n\
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\n\
-Types: deb\n\
-URIs: https://security.debian.org/debian-security\n\
-Suites: bookworm-security\n\
-Components: main contrib non-free non-free-firmware\n\
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
-> /etc/apt/sources.list.d/debian.sources
-
-RUN apt-get update && apt-get install -y gcc && \
-    pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple && \
+# 设置 apt-get 镜像源为阿里云
+RUN echo "deb https://mirrors.aliyun.com/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb-src https://mirrors.aliyun.com/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
+    apt-get update && apt-get install -y gcc && \
     mkdir -p build && \
     pip wheel -w build tgcrypto
 
+# Final image
 FROM python:3.12-slim
-COPY --from=builder /build/*.whl /tmp/
-COPY --from=builder /etc/apt/sources.list.d/debian.sources/* /etc/apt/sources.list.d/debian.sources/
 
-ENV TZ=Asia/Shanghai
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-RUN apt-get update && apt-get install -y tzdata && \
-    pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple && \
-    pip install /tmp/*.whl && \
+# 设置 apt-get 镜像源为阿里云
+RUN echo "deb https://mirrors.aliyun.com/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb-src https://mirrors.aliyun.com/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
+    apt-get update && apt-get install -y bash
+
+# 配置 pip 使用阿里云的 PyPI 镜像
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# Copy built wheel from builder stage
+COPY --from=builder /build/*.whl /tmp/
+
+# 安装需要的 Python 包
+RUN pip install /tmp/*.whl && \
     pip install -U "tg-signer[tgcrypto]"
 
+# 将 start.sh 脚本复制到容器的指定目录
+COPY start.sh /opt/tg-signer-config/start.sh
+
+# 使 start.sh 脚本可执行
+RUN chmod +x /opt/tg-signer-config/start.sh
+
+# 复制 entrypoint.sh 脚本到容器中
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# 给 entrypoint.sh 脚本执行权限
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# 设置默认的工作目录
 WORKDIR /opt/tg-signer
+
+# 设置容器的入口点
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# 默认命令（如果没有传入其他命令）
+CMD ["bash"]
