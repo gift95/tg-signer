@@ -1,9 +1,9 @@
 # Build stage
 FROM python:3.12-slim AS builder
 
-# 设置 apt-get 镜像源为阿里云
-RUN echo "deb https://mirrors.aliyun.com/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
-    echo "deb-src https://mirrors.aliyun.com/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
+# 设置 apt-get 镜像源为清华镜像
+RUN echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
     apt-get update && apt-get install -y gcc && \
     mkdir -p build && \
     pip wheel -w build tgcrypto
@@ -11,13 +11,13 @@ RUN echo "deb https://mirrors.aliyun.com/debian/ stable main contrib non-free" >
 # Final image
 FROM python:3.12-slim
 
-# 设置 apt-get 镜像源为阿里云
-RUN echo "deb https://mirrors.aliyun.com/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
-    echo "deb-src https://mirrors.aliyun.com/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
+# 设置 apt-get 镜像源为清华镜像
+RUN echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian/ stable main contrib non-free" > /etc/apt/sources.list && \
+    echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/debian/ stable main contrib non-free" >> /etc/apt/sources.list && \
     apt-get update && apt-get install -y bash
 
-# 配置 pip 使用阿里云的 PyPI 镜像
-RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+# 配置 pip 使用清华的 PyPI 镜像
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Copy built wheel from builder stage
 COPY --from=builder /build/*.whl /tmp/
