@@ -24,5 +24,6 @@ COPY start.sh /opt/tg-signer/start.sh
 # Make the start.sh script executable
 RUN chmod +x /opt/tg-signer/start.sh
 
+ENTRYPOINT  [ "sh", "entrypoint.sh" ]
 # Set the default command to run the script
 CMD ["/opt/tg-signer/start.sh"]
