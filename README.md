@@ -27,7 +27,8 @@ pip install -U tg-signer
 ```sh
 pip install "tg-signer[speedup]"
 ```
-### Docker
+#### Docker
+
 ```sh
 docker pull gift95/tg-signer:latest
 ```
