@@ -27,7 +27,10 @@ pip install -U tg-signer
 ```sh
 pip install "tg-signer[speedup]"
 ```
-
+### Docker安装
+```sh
+docker pull gift95/tg-signer:latest
+```
 #### Docker
 
 未上传直接使用的镜像，可以自行build镜像，见[docker](./docker) 目录下的Dockerfile和 [README](./docker/README.md) 。
