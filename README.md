@@ -5,12 +5,10 @@
 ### 功能
 
 - 每日定时和随机误差时间签到
-
 - 根据配置的文本点击键盘
-
 - 调用AI进行图片识别并点击键盘
-
-- 个人、群组、频道消息监控与自动回复
+- 个人、群组、频道消息监控、转发与自动回复
+- 根据配置执行动作流
 
   **...**
 
@@ -139,16 +137,54 @@ tg-signer run linuxdo
 ```
 开始配置任务<linuxdo>
 第1个签到
-1. Chat ID（登录时最近对话输出中的ID）: 10086
-2. 签到文本（如 /sign）: /check_in
-3. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 5
-4. 是否有键盘？(y/N)：y
-5. 键盘中需要点击的按钮文本（无则直接回车）: 签到
-6. 是否需要通过图片识别选择选项？(y/N)：y
+一. Chat ID（登录时最近对话输出中的ID）: 7661096533
+二. Chat名称（可选）: jerry bot
+三. 开始配置<动作>，请按照实际签到顺序配置。
+  1: 发送普通文本
+  2: 发送Dice类型的emoji
+  3: 根据文本点击键盘
+  4: 根据图片选择选项
+  5: 回复计算题
+
+第1个动作:
+1. 输入对应的数字选择动作: 1
+2. 输入要发送的文本: checkin
+3. 是否继续添加动作？(y/N)：y
+第2个动作:
+1. 输入对应的数字选择动作: 3
+2. 键盘中需要点击的按钮文本: 签到
+3. 是否继续添加动作？(y/N)：y
+第3个动作:
+1. 输入对应的数字选择动作: 4
+图片识别将使用大模型回答，请确保大模型支持图片识别。
+2. 是否继续添加动作？(y/N)：y
+第4个动作:
+1. 输入对应的数字选择动作: 5
+计算题将使用大模型回答。
+2. 是否继续添加动作？(y/N)：y
+第5个动作:
+1. 输入对应的数字选择动作: 2
+2. 输入要发送的骰子（如 🎲, 🎯）: 🎲
+3. 是否继续添加动作？(y/N)：n
 在运行前请通过环境变量正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`。默认模型为"gpt-4o", 可通过环境变量`OPENAI_MODEL`更改。
+四. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 10
+╔════════════════════════════════════════════════╗
+║ Chat ID: 7661096533                            ║
+║ Name: jerry bot                                ║
+║ Delete After: 10                               ║
+╟────────────────────────────────────────────────╢
+║ Actions Flow:                                  ║
+║ 1. [发送普通文本] Text: checkin                ║
+║ 2. [根据文本点击键盘] Click: 签到              ║
+║ 3. [根据图片选择选项]                          ║
+║ 4. [回复计算题]                                ║
+║ 5. [发送Dice类型的emoji] Dice: 🎲              ║
+╚════════════════════════════════════════════════╝
+第1个签到配置成功
+
 继续配置签到？(y/N)：n
-每日签到时间（如 06:00:00）: 08:10:00
-签到时间误差随机秒数（默认为0）: 10
+每日签到时间（time或crontab表达式，如'06:00:00'或'0 6 * * *'）:
+签到时间误差随机秒数（默认为0）: 300
 ```
 
 ### 配置与运行监控
@@ -183,7 +219,24 @@ tg-signer monitor run my_monitor
 5. 默认发送文本:
 6. 从消息中提取发送文本的正则表达式: 参与关键词：「(?P<keyword>(.*?))」\n
 7. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 5
+继续配置？(y/N)：y
+
+配置第3个监控项
+1. Chat ID（登录时最近对话输出中的ID）: -4573702599
+2. 匹配规则(exact, contains, regex, all): all
+3. 只匹配来自特定用户ID的消息（多个用逗号隔开, 匹配所有用户直接回车）:
+4. 总是忽略自己发送的消息（y/N）: y
+5. 默认发送文本（不需要则回车）:
+6. 是否使用AI进行回复(y/N): n
+7. 从消息中提取发送文本的正则表达式（不需要则直接回车）:
+8. 是否通过Server酱推送消息(y/N): n
+9. 是否需要转发到外部（UDP, Http）(y/N): y
+10. 是否需要转发到UDP(y/N): y
+11. 请输入UDP服务器地址和端口（形如`127.0.0.1:1234`）: 127.0.0.1:9999
+12. 是否需要转发到Http(y/N): y
+13. 请输入Http地址（形如`http://127.0.0.1:1234`）: http://127.0.0.1:8000/tg/user1/messages
 继续配置？(y/N)：n
+
 ```
 
 #### 示例解释：
@@ -211,6 +264,92 @@ tg-signer monitor run my_monitor
     6. 提取发布文本的正则，例如 "参与关键词：「(.*?)」\n" ，注意用括号`(...)` 捕获要提取的文本，
        可以捕获第3点示例消息的关键词"我要抽奖"并自动发送
 
+3. 消息Message结构参考:
+
+```json
+{
+    "_": "Message",
+    "id": 2950,
+    "from_user": {
+        "_": "User",
+        "id": 123456789,
+        "is_self": false,
+        "is_contact": false,
+        "is_mutual_contact": false,
+        "is_deleted": false,
+        "is_bot": false,
+        "is_verified": false,
+        "is_restricted": false,
+        "is_scam": false,
+        "is_fake": false,
+        "is_support": false,
+        "is_premium": false,
+        "is_contact_require_premium": false,
+        "is_close_friend": false,
+        "is_stories_hidden": false,
+        "is_stories_unavailable": true,
+        "is_business_bot": false,
+        "first_name": "linux",
+        "status": "UserStatus.ONLINE",
+        "next_offline_date": "2025-05-30 11:52:40",
+        "username": "linuxdo",
+        "dc_id": 5,
+        "phone_number": "*********",
+        "photo": {
+            "_": "ChatPhoto",
+            "small_file_id": "AQADBQADqqcxG6hqrTMAEAIAA6hqrTMABLkwVDcqzBjAAAQeBA",
+            "small_photo_unique_id": "AgADqqcxG6hqrTM",
+            "big_file_id": "AQADBQADqqcxG6hqrTMAEAMAA6hqrTMABLkwVDcqzBjAAAQeBA",
+            "big_photo_unique_id": "AgADqqcxG6hqrTM",
+            "has_animation": false,
+            "is_personal": false
+        },
+        "added_to_attachment_menu": false,
+        "inline_need_location": false,
+        "can_be_edited": false,
+        "can_be_added_to_attachment_menu": false,
+        "can_join_groups": false,
+        "can_read_all_group_messages": false,
+        "has_main_web_app": false
+    },
+    "date": "2025-05-30 11:47:46",
+    "chat": {
+        "_": "Chat",
+        "id": -52737131599,
+        "type": "ChatType.GROUP",
+        "is_creator": true,
+        "is_deactivated": false,
+        "is_call_active": false,
+        "is_call_not_empty": false,
+        "title": "测试组",
+        "has_protected_content": false,
+        "members_count": 4,
+        "permissions": {
+            "_": "ChatPermissions",
+            "can_send_messages": true,
+            "can_send_media_messages": true,
+            "can_send_other_messages": true,
+            "can_send_polls": true,
+            "can_add_web_page_previews": true,
+            "can_change_info": true,
+            "can_invite_users": true,
+            "can_pin_messages": true,
+            "can_manage_topics": true
+        }
+    },
+    "from_offline": false,
+    "show_caption_above_media": false,
+    "mentioned": false,
+    "scheduled": false,
+    "from_scheduled": false,
+    "edit_hidden": false,
+    "has_protected_content": false,
+    "text": "test, 测试",
+    "video_processing_pending": false,
+    "outgoing": false
+}
+```
+
 #### 示例运行输出：
 
 ```
@@ -228,38 +367,55 @@ tg-signer monitor run my_monitor
 
 ### 版本变动日志
 
-#### 0.6.3
+#### 0.7.2
+- 支持将消息转发至外部端点，通过：
+  - UDP
+  - HTTP
+- 将kurirogram替换为kurigram
 
+#### 0.7.0
+- 支持每个聊天会话按序执行多个动作，动作类型：
+  - 发送文本
+  - 发送骰子
+  - 按文本点击键盘
+  - 通过图片选择选项
+  - 通过计算题回复
+
+#### 0.6.6
+- 增加对发送DICE消息的支持
+
+#### 0.6.5
+- 修复使用同一套配置运行多个账号时签到记录共用的问题
+
+#### 0.6.4
+- 增加对简单计算题的支持
+- 改进签到配置和消息处理
+
+#### 0.6.3
 - 兼容kurigram 2.1.38版本的破坏性变更
 > Remove coroutine param from run method [a7afa32](https://github.com/KurimuzonAkuma/pyrogram/commit/a7afa32df208333eecdf298b2696a2da507bde95)
 
 
 #### 0.6.2
-
 - 忽略签到时发送消息失败的聊天
 
 #### 0.6.1
-
 - 支持点击按钮文本后继续进行图片识别
 
 #### 0.6.0
-
 - Signer支持通过crontab定时
 - Monitor匹配规则添加`all`支持所有消息
 - Monitor支持匹配到消息后通过server酱推送
 - Signer新增`multi-run`用于使用一套配置同时运行多个账号
 
 #### 0.5.2
-
 - Monitor支持配置AI进行消息回复
 - 增加批量配置「Telegram自带的定时发送消息功能」的功能
 
 #### 0.5.1
-
 - 添加`import`和`export`命令用于导入导出配置
 
 #### 0.5.0
-
 - 根据配置的文本点击键盘
 - 调用AI识别图片点击键盘
 
