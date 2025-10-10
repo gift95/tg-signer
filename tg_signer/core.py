@@ -8,16 +8,26 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
-from typing import BinaryIO, Optional, Type, TypedDict, TypeVar, Union
+from typing import (
+    BinaryIO,
+    Generic,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 from urllib import parse
 
+import httpx
 from croniter import CroniterBadCronError, croniter
+from pydantic import BaseModel, ConfigDict, ValidationError
 from pyrogram import Client as BaseClient
 from pyrogram import errors, filters
 from pyrogram.enums import ChatMembersFilter, ChatType
 from pyrogram.handlers import MessageHandler
 from pyrogram.methods.utilities.idle import idle
-from pyrogram.session import Session as BaseSession
+from pyrogram.session import Session
 from pyrogram.storage import MemoryStorage
 from pyrogram.types import (
     Chat,
@@ -29,33 +39,71 @@ from pyrogram.types import (
 )
 
 from tg_signer.config import (
+    ActionT,
     BaseJSONConfig,
+    ChooseOptionByImageAction,
+    ClickKeyboardByTextAction,
+    HttpCallback,
     MatchConfig,
     MonitorConfig,
-    SignChat,
-    SignConfig,
+    ReplyByCalculationProblemAction,
+    SendDiceAction,
+    SendTextAction,
+    SignChatV3,
+    SignConfigV3,
+    SupportAction,
+    UDPForward,
 )
 
-from .ai_tools import choose_option_by_image, get_openai_client, get_reply
+from .ai_tools import (
+    calculate_problem,
+    choose_option_by_image,
+    get_openai_client,
+    get_reply,
+)
 from .notification.server_chan import sc_send
+from .utils import NumberingLangT, numbering
 
 logger = logging.getLogger("tg-signer")
 
 print_to_user = print
 
+DICE_EMOJIS = ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰")
 
-class Session(BaseSession):
-    START_TIMEOUT = 5
+Session.START_TIMEOUT = 5  # 原始超时时间为2秒，但一些代理访问会超时，所以这里调大一点
 
 
 class UserInput:
-    def __init__(self, index: int = 1):
+    def __init__(self, index: int = 1, numbering_lang: NumberingLangT = "arabic"):
         self.index = index
+        self.numbering_lang = numbering_lang
+
+    def incr(self, n: int = 1):
+        self.index += n
+
+    def decr(self, n: int = 1):
+        self.index -= n
+
+    @property
+    def index_str(self):
+        return f"{numbering(self.index, self.numbering_lang)}. "
 
     def __call__(self, prompt: str = None):
-        r = input(f"{self.index}. {prompt}")
-        self.index += 1
+        r = input(f"{self.index_str}{prompt}")
+        self.incr(1)
         return r
+
+
+def indent(
+    s: str,
+    level=0,
+    indentation: str = "\t",
+    sep: str = "\n",
+):
+    r = ""
+    for line in s.split(sep):
+        r += indentation * level + line + sep
+    return r
 
 
 def readable_message(message: Message):
@@ -90,49 +138,50 @@ def readable_chat(chat: Chat):
     return f"id: {chat.id}, username: {none_or_dash(chat.username)}, title: {none_or_dash(chat.title)}, type: {type_}, name: {none_or_dash(chat.first_name)}"
 
 
+_CLIENT_INSTANCES: dict[str, "Client"] = {}
+
+# reference counts and async locks for shared client lifecycle management
+# Keyed by account name. Use asyncio locks to serialize start/stop operations
+# so multiple coroutines in the same process can safely share one Client.
+_CLIENT_REFS: defaultdict[str, int] = defaultdict(int)
+_CLIENT_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
+
 class Client(BaseClient):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, name: str, *args, **kwargs):
+        key = kwargs.pop("key", None)
+        super().__init__(name, *args, **kwargs)
+        self.key = key or str(self.session_string_file.resolve())
         if self.in_memory and not self.session_string:
             self.load_session_string()
             self.storage = MemoryStorage(self.name, self.session_string)
 
     async def __aenter__(self):
-        try:
-            return await self.start()
-        except ConnectionError:
-            pass
+        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CLIENT_ASYNC_LOCKS[self.key] = lock
+        async with lock:
+            _CLIENT_REFS[self.key] += 1
+            if _CLIENT_REFS[self.key] == 1:
+                try:
+                    await self.start()
+                except ConnectionError:
+                    pass
+            return self
 
-    async def connect(
-        self: "Client",
-    ) -> bool:
-        """
-        Connect the client to Telegram servers.
-
-        Returns:
-            ``bool``: On success, in case the passed-in session is authorized, True is returned. Otherwise, in case
-            the session needs to be authorized, False is returned.
-
-        Raises:
-            ConnectionError: In case you try to connect an already connected client.
-        """
-        if self.is_connected:
-            raise ConnectionError("Client is already connected")
-
-        await self.load_session()
-
-        self.session = Session(
-            self,
-            await self.storage.dc_id(),
-            await self.storage.auth_key(),
-            await self.storage.test_mode(),
-        )
-
-        await self.session.start()
-
-        self.is_connected = True
-
-        return bool(await self.storage.user_id())
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
+        if lock is None:
+            return
+        async with lock:
+            _CLIENT_REFS[self.key] -= 1
+            if _CLIENT_REFS[self.key] == 0:
+                try:
+                    await self.stop()
+                except ConnectionError:
+                    pass
+                _CLIENT_INSTANCES.pop(self.key, None)
 
     @property
     def session_string_file(self):
@@ -175,6 +224,7 @@ def get_proxy(proxy: str = None):
             "username": r.username,
             "password": r.password,
         }
+    return None
 
 
 def get_client(
@@ -187,16 +237,21 @@ def get_client(
 ):
     proxy = proxy or get_proxy()
     api_id, api_hash = get_api_config()
-    return Client(
+    key = str(pathlib.Path(workdir).joinpath(name).resolve())
+    if key in _CLIENT_INSTANCES:
+        return _CLIENT_INSTANCES[key]
+    client = Client(
         name,
-        api_id,
-        api_hash,
+        api_id=api_id,
+        api_hash=api_hash,
         proxy=proxy,
         workdir=workdir,
         session_string=session_string,
         in_memory=in_memory,
         **kwargs,
     )
+    _CLIENT_INSTANCES[key] = client
+    return client
 
 
 def get_now():
@@ -213,10 +268,10 @@ def make_dirs(path: pathlib.Path, exist_ok=True):
 ConfigT = TypeVar("ConfigT", bound=BaseJSONConfig)
 
 
-class BaseUserWorker:
+class BaseUserWorker(Generic[ConfigT]):
     _workdir = "."
     _tasks_dir = "tasks"
-    cfg_cls: Type[ConfigT] = BaseJSONConfig
+    cfg_cls: Type["ConfigT"] = BaseJSONConfig
 
     def __init__(
         self,
@@ -227,6 +282,8 @@ class BaseUserWorker:
         workdir=None,
         session_string: str = None,
         in_memory: bool = False,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self.task_name = task_name or "my_task"
         self._session_dir = pathlib.Path(session_dir)
@@ -240,7 +297,9 @@ class BaseUserWorker:
             workdir=self._session_dir,
             session_string=session_string,
             in_memory=in_memory,
+            loop=loop,
         )
+        self.loop = self.app.loop
         self.user: Optional[User] = None
         self._config = None
         self.context = self.ensure_ctx()
@@ -250,8 +309,7 @@ class BaseUserWorker:
 
     def app_run(self, coroutine=None):
         if coroutine is not None:
-            loop = asyncio.get_event_loop()
-            run = loop.run_until_complete
+            run = self.loop.run_until_complete
             run(coroutine)
         else:
             self.app.run()
@@ -292,7 +350,7 @@ class BaseUserWorker:
         self._config = value
 
     def log(self, msg, level: str = "INFO", **kwargs):
-        msg = f"{self._account}: {msg}"
+        msg = f"账户「{self._account}」- 任务「{self.task_name}」: {msg}"
         if level.upper() == "INFO":
             logger.info(msg, **kwargs)
         elif level.upper() == "WARNING":
@@ -386,7 +444,7 @@ class BaseUserWorker:
         is_authorized = await self.app.connect()
         if not is_authorized:
             await self.app.storage.delete()
-            return
+            return None
         return await self.app.log_out()
 
     async def send_message(
@@ -409,6 +467,38 @@ class BaseUserWorker:
             await asyncio.sleep(delete_after)
             await message.delete()
             self.log(f"Message「{text}」 to {chat_id} deleted!")
+        return message
+
+    async def send_dice(
+        self,
+        chat_id: Union[int, str],
+        emoji: str = "🎲",
+        delete_after: int = None,
+        **kwargs,
+    ):
+        """
+        发送DICE类型消息
+        :param chat_id:
+        :param emoji: Should be one of "🎲", "🎯", "🏀", "⚽", "🎳", or "🎰".
+        :param delete_after:
+        :param kwargs:
+        :return:
+        """
+        emoji = emoji.strip()
+        if emoji not in DICE_EMOJIS:
+            self.log(
+                f"Warning, emoji should be one of {', '.join(DICE_EMOJIS)}",
+                level="WARNING",
+            )
+        message = await self.app.send_dice(chat_id, emoji, **kwargs)
+        if message and delete_after is not None:
+            self.log(
+                f"Dice「{emoji}」 to {chat_id} will be deleted after {delete_after} seconds."
+            )
+            self.log("Waiting...")
+            await asyncio.sleep(delete_after)
+            await message.delete()
+            self.log(f"Dice「{emoji}」 to {chat_id} deleted!")
         return message
 
     async def search_members(
@@ -451,7 +541,7 @@ class BaseUserWorker:
         raise NotImplementedError
 
 
-class WaitCounter:
+class Waiter:
     def __init__(self):
         self.waiting_ids = set()
         self.waiting_counter = Counter()
@@ -480,81 +570,133 @@ class WaitCounter:
         return f"<{self.__class__.__name__}: {self.waiting_counter}>"
 
 
-class UserSignerWorkerContext(TypedDict, total=False):
-    waiting_counter: WaitCounter
-    sign_chats: dict[int, list[SignChat]]
+class UserSignerWorkerContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    waiter: Waiter
+    sign_chats: defaultdict[int, List[SignChatV3]]
+    chat_messages: defaultdict[int, List[Message]]
 
 
 OPENAI_USE_PROMPT = '在运行前请通过环境变量正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`。默认模型为"gpt-4o", 可通过环境变量`OPENAI_MODEL`更改。'
 
 
-class UserSigner(BaseUserWorker):
+class UserSigner(BaseUserWorker[SignConfigV3]):
     _workdir = ".signer"
     _tasks_dir = "signs"
-    cfg_cls = SignConfig
+    cfg_cls = SignConfigV3
     context: UserSignerWorkerContext
 
     def ensure_ctx(self) -> UserSignerWorkerContext:
-        return {"waiting_counter": WaitCounter(), "sign_chats": defaultdict(list)}
+        return UserSignerWorkerContext(
+            waiter=Waiter(),
+            sign_chats=defaultdict(list),
+            chat_messages=defaultdict(list),
+        )
 
     @property
     def sign_record_file(self):
-        return self.task_dir.joinpath("sign_record.json")
+        sign_record_dir = self.task_dir / str(self.user.id)
+        make_dirs(sign_record_dir)
+        return sign_record_dir / "sign_record.json"
 
-    def ask_one(self) -> SignChat:
-        input_ = UserInput()
+    def _ask_actions(
+        self, input_: UserInput, available_actions: List[SupportAction] = None
+    ) -> List[ActionT]:
+        print_to_user(f"{input_.index_str}开始配置<动作>，请按照实际签到顺序配置。")
+        available_actions = available_actions or list(SupportAction)
+        for action in available_actions:
+            print_to_user(f"  {action.value}: {action.desc}")
+        print_to_user()
+        actions = []
+        print_openai_prompt = False
+        while True:
+            try:
+                local_input_ = UserInput()
+                print_to_user(f"第{len(actions) + 1}个动作: ")
+                action_str = local_input_("输入对应的数字选择动作: ").strip()
+                action = SupportAction(int(action_str))
+                if action not in available_actions:
+                    raise ValueError(f"不支持的动作: {action}")
+                if len(actions) == 0 and action not in [
+                    SupportAction.SEND_TEXT,
+                    SupportAction.SEND_DICE,
+                ]:
+                    raise ValueError(
+                        f"第一个动作必须为「{SupportAction.SEND_TEXT.desc}」或「{SupportAction.SEND_DICE.desc}」"
+                    )
+                if action == SupportAction.SEND_TEXT:
+                    text = local_input_("输入要发送的文本: ")
+                    actions.append(SendTextAction(text=text))
+                elif action == SupportAction.SEND_DICE:
+                    dice = local_input_("输入要发送的骰子（如 🎲, 🎯）: ")
+                    actions.append(SendDiceAction(dice=dice))
+                elif action == SupportAction.CLICK_KEYBOARD_BY_TEXT:
+                    text_of_btn_to_click = local_input_("键盘中需要点击的按钮文本: ")
+                    actions.append(ClickKeyboardByTextAction(text=text_of_btn_to_click))
+                elif action == SupportAction.CHOOSE_OPTION_BY_IMAGE:
+                    print_to_user(
+                        "图片识别将使用大模型回答，请确保大模型支持图片识别。"
+                    )
+                    print_openai_prompt = True
+                    actions.append(ChooseOptionByImageAction())
+                elif action == SupportAction.REPLY_BY_CALCULATION_PROBLEM:
+                    print_to_user("计算题将使用大模型回答。")
+                    print_openai_prompt = True
+                    actions.append(ReplyByCalculationProblemAction())
+                else:
+                    raise ValueError(f"不支持的动作: {action}")
+                if local_input_("是否继续添加动作？(y/N)：").strip().lower() != "y":
+                    break
+            except (ValueError, ValidationError) as e:
+                print_to_user("错误: ")
+                print_to_user(e)
+        if print_openai_prompt:
+            print_to_user(OPENAI_USE_PROMPT)
+        input_.incr()
+        return actions
+
+    def ask_one(self) -> SignChatV3:
+        input_ = UserInput(numbering_lang="chinese_simple")
         chat_id = int(input_("Chat ID（登录时最近对话输出中的ID）: "))
-        sign_text = input_("签到文本（如 /sign）: ") or "/sign"
+        name = input_("Chat名称（可选）: ")
+        actions = self._ask_actions(input_)
         delete_after = (
             input_(
-                "等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: "
+                "等待N秒后删除消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: "
             )
             or None
         )
         if delete_after:
             delete_after = int(delete_after)
-        has_keyboard = input_("是否有键盘？(y/N)：")
-        text_of_btn_to_click = None
-        choose_option_by_image_ = False
-        if has_keyboard.strip().lower() == "y":
-            text_of_btn_to_click = input_(
-                "键盘中需要点击的按钮文本（无则直接回车）: "
-            ).strip()
-            choose_option_by_image_input = input_(
-                "是否需要通过图片识别选择选项？(y/N)："
-            )
-            if choose_option_by_image_input.strip().lower() == "y":
-                choose_option_by_image_ = True
-                print_to_user(OPENAI_USE_PROMPT)
-        return SignChat.model_validate(
-            {
-                "chat_id": chat_id,
-                "sign_text": sign_text,
-                "delete_after": delete_after,
-                "text_of_btn_to_click": text_of_btn_to_click,
-                "choose_option_by_image": choose_option_by_image_,
-            }
-        )
+        cfgs = {
+            "chat_id": chat_id,
+            "name": name,
+            "delete_after": delete_after,
+            "actions": actions,
+        }
+        return SignChatV3.model_validate(cfgs)
 
-    def ask_for_config(self) -> "SignConfig":
+    def ask_for_config(self) -> "SignConfigV3":
         chats = []
         i = 1
-        print_to_user(f"开始配置任务<{self.task_name}>")
+        print_to_user(f"开始配置任务<{self.task_name}>\n")
         while True:
-            print_to_user(f"第{i}个签到")
+            print_to_user(f"第{i}个任务: ")
             try:
-                chats.append(self.ask_one())
+                chat = self.ask_one()
+                print_to_user(chat)
+                print_to_user(f"第{i}个任务配置成功\n")
+                chats.append(chat)
             except Exception as e:
                 print_to_user(e)
                 print_to_user("配置失败")
                 i -= 1
-            continue_ = input("继续配置签到？(y/N)：")
+            continue_ = input("继续配置任务？(y/N)：")
             if continue_.strip().lower() != "y":
                 break
             i += 1
-        sign_at_prompt = (
-            "每日签到时间（time或crontab表达式，如'06:00:00'或'0 6 * * *'）: "
-        )
+        sign_at_prompt = "签到时间（time或crontab表达式，如'06:00:00'或'0 6 * * *'）: "
         sign_at_str = input(sign_at_prompt) or "06:00:00"
         while not (sign_at := self._validate_sign_at(sign_at_str)):
             print_to_user("请输入正确的时间格式")
@@ -562,7 +704,7 @@ class UserSigner(BaseUserWorker):
 
         random_seconds_str = input("签到时间误差随机秒数（默认为0）: ") or "0"
         random_seconds = int(float(random_seconds_str))
-        config = SignConfig.model_validate(
+        config = SignConfigV3.model_validate(
             {
                 "chats": chats,
                 "sign_at": sign_at,
@@ -600,8 +742,14 @@ class UserSigner(BaseUserWorker):
                 sign_record = json.load(fp)
         return sign_record
 
-    async def sign(self, chat_id: int, sign_text: str, delete_after: int = None):
-        return await self.send_message(chat_id, sign_text, delete_after)
+    async def sign(
+        self,
+        chat: SignChatV3,
+    ):
+        self.log(f"开始执行: \n{chat}")
+        for action in chat.actions:
+            await self.wait_for(chat, action)
+            await asyncio.sleep(chat.action_interval)
 
     async def run(
         self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
@@ -612,6 +760,37 @@ class UserSigner(BaseUserWorker):
         config = self.load_config(self.cfg_cls)
         sign_record = self.load_sign_record()
         chat_ids = [c.chat_id for c in config.chats]
+
+        async def sign_once():
+            for chat in config.chats:
+                self.context.sign_chats[chat.chat_id].append(chat)
+                try:
+                    await self.sign(chat)
+                except errors.RPCError as _e:
+                    self.log(f"签到失败: {_e} \nchat: \n{chat}")
+                    logger.warning(_e, exc_info=True)
+                    continue
+
+                self.context.chat_messages[chat.chat_id].clear()
+                await asyncio.sleep(config.sign_interval)
+            sign_record[str(now.date())] = now.isoformat()
+            with open(self.sign_record_file, "w", encoding="utf-8") as fp:
+                json.dump(sign_record, fp)
+
+        def need_sign(last_date_str):
+            if force_rerun:
+                return True
+            if last_date_str not in sign_record:
+                return True
+            _last_sign_at = datetime.fromisoformat(sign_record[last_date_str])
+            self.log(f"上次执行时间: {_last_sign_at}")
+            _cron_it = croniter(self._validate_sign_at(config.sign_at), _last_sign_at)
+            _next_run: datetime = _cron_it.next(datetime)
+            if _next_run > now:
+                self.log("当前未到下次执行时间，无需执行")
+                return False
+            return True
+
         while True:
             self.log(f"为以下Chat添加消息回调处理函数：{chat_ids}")
             self.app.add_handler(
@@ -622,39 +801,9 @@ class UserSigner(BaseUserWorker):
                     now = get_now()
                     self.log(f"当前时间: {now}")
                     now_date_str = str(now.date())
-                    self.context["waiting_counter"].clear()
-                    if now_date_str not in sign_record or force_rerun:
-                        for chat in config.chats:
-                            self.context["sign_chats"][chat.chat_id].append(chat)
-                            self.log(f"发送消息至「{chat.chat_id}」")
-                            try:
-                                await self.sign(
-                                    chat.chat_id, chat.sign_text, chat.delete_after
-                                )
-                            except errors.BadRequest as e:
-                                self.log(f"发送消息失败：{e}")
-                                continue
-
-                            if chat.has_keyboard:
-                                self.context["waiting_counter"].add(chat.chat_id)
-                            await asyncio.sleep(0.5)
-                        sign_record[now_date_str] = now.isoformat()
-                        with open(self.sign_record_file, "w", encoding="utf-8") as fp:
-                            json.dump(sign_record, fp)
-
-                        wait_seconds = 300
-                        self.log(f"最多等待{wait_seconds}秒，用于响应可能的键盘点击...")
-                        _start = time.perf_counter()
-                        while (time.perf_counter() - _start) <= wait_seconds and bool(
-                            self.context["waiting_counter"]
-                        ):
-                            await asyncio.sleep(1)
-                        self.log("Done")
-
-                    else:
-                        print_to_user(
-                            f"当前任务今日已签到，签到时间: {sign_record[now_date_str]}"
-                        )
+                    self.context = self.ensure_ctx()
+                    if need_sign(now_date_str):
+                        await sign_once()
 
             except (OSError, errors.Unauthorized) as e:
                 logger.exception(e)
@@ -681,6 +830,18 @@ class UserSigner(BaseUserWorker):
         async with self.app:
             await self.send_message(chat_id, text, delete_after, **kwargs)
 
+    async def send_dice_cli(
+        self,
+        chat_id: Union[str, int],
+        emoji: str = "🎲",
+        delete_after: int = None,
+        **kwargs,
+    ):
+        if self.user is None:
+            await self.login(print_chat=False)
+        async with self.app:
+            await self.send_dice(chat_id, emoji, delete_after, **kwargs)
+
     async def on_message(self, client, message: Message):
         try:
             await self._on_message(client, message)
@@ -691,83 +852,123 @@ class UserSigner(BaseUserWorker):
         self.log(
             f"收到来自「{message.from_user.username or message.from_user.id}」的消息: {readable_message(message)}"
         )
-        chats = self.context["sign_chats"].get(message.chat.id)
+        chats = self.context.sign_chats.get(message.chat.id)
         if not chats:
             self.log("忽略意料之外的聊天", level="WARNING")
             return
-        # 依次尝试匹配。同一个chat可能配置多个签到，但是没办法保持对方的回复按序到达
-        for chat in chats:
-            ok = await self.handle_one_chat(chat, client, message)
-            if ok:
-                self.context["waiting_counter"].sub(message.chat.id)
-                break
+        self.context.chat_messages[message.chat.id].append(message)
 
-    async def handle_one_chat(
-        self, chat: SignChat, client: Client, message: Message
-    ) -> Optional[bool]:
-        if not chat.has_keyboard:
-            self.log("忽略，未显式配置需要点击按钮的选项")
-            return False
-        text_of_btn_to_click = chat.text_of_btn_to_click
+    async def _click_keyboard_by_text(
+        self, action: ClickKeyboardByTextAction, message: Message
+    ):
         if reply_markup := message.reply_markup:
             if isinstance(reply_markup, InlineKeyboardMarkup):
-                clicked = False
                 flat_buttons = (b for row in reply_markup.inline_keyboard for b in row)
                 option_to_btn: dict[str, InlineKeyboardButton] = {}
-                if not text_of_btn_to_click:
-                    option_to_btn = {btn.text: btn for btn in flat_buttons if btn.text}
-                else:
-                    # 遍历button并根据配置的按钮文本匹配
-                    for btn in flat_buttons:
-                        option_to_btn[btn.text] = btn
-                        if text_of_btn_to_click in btn.text:
-                            self.log(f"点击按钮: {btn.text}")
-                            clicked = True
-                            await self.request_callback_answer(
-                                client, message.chat.id, message.id, btn.callback_data
-                            )
-                            break
-                    if clicked:
-                        if chat.choose_option_by_image:
-                            logger.info(
-                                "该聊天同时配置了点击按钮文本和图片识别选项，将继续等待下一步「图片识别」的消息"
-                            )
-                            self.context["waiting_counter"].add(message.chat.id)
-                        return True
-                if message.photo is not None and chat.choose_option_by_image:
-                    self.log("检测到图片，尝试调用大模型进行图片")
-                    ai_client = get_openai_client()
-                    if not ai_client:
-                        self.log(
-                            "未配置OpenAI API Key，无法使用AI服务", level="WARNING"
+                for btn in flat_buttons:
+                    option_to_btn[btn.text] = btn
+                    if action.text in btn.text:
+                        self.log(f"点击按钮: {btn.text}")
+                        await self.request_callback_answer(
+                            self.app,
+                            message.chat.id,
+                            message.id,
+                            btn.callback_data,
                         )
-                        return False
-                    image_buffer: BinaryIO = await client.download_media(
-                        message.photo.file_id, in_memory=True
+                        return True
+        return False
+
+    async def _reply_by_calculation_problem(
+        self, action: ReplyByCalculationProblemAction, message
+    ):
+        if message.text:
+            self.log("检测到文本回复，尝试调用大模型进行计算题回答")
+            ai_client = get_openai_client()
+            if not ai_client:
+                self.log("未配置OpenAI API Key，无法使用AI服务", level="WARNING")
+                return False
+            self.log(f"问题: \n{message.text}")
+            answer = await calculate_problem(message.text, client=ai_client)
+            self.log(f"回答为: {answer}")
+            await self.send_message(message.chat.id, answer)
+            return True
+        return False
+
+    async def _choose_option_by_image(self, action: ChooseOptionByImageAction, message):
+        if reply_markup := message.reply_markup:
+            if isinstance(reply_markup, InlineKeyboardMarkup) and message.photo:
+                flat_buttons = (b for row in reply_markup.inline_keyboard for b in row)
+                option_to_btn = {btn.text: btn for btn in flat_buttons if btn.text}
+                self.log("检测到图片，尝试调用大模型进行图片识别并选择选项")
+                ai_client = get_openai_client()
+                if not ai_client:
+                    self.log(
+                        "未配置OpenAI API Key，无法使用AI服务",
+                        level="WARNING",
                     )
-                    image_buffer.seek(0)
-                    image_bytes = image_buffer.read()
-                    options = list(option_to_btn)
-                    result_index = await choose_option_by_image(
-                        image_bytes,
-                        "选择正确的选项",
-                        list(enumerate(options)),
-                        client=ai_client,
-                    )
-                    result = options[result_index]
-                    self.log(f"选择结果为: {result}")
-                    target_btn = option_to_btn.get(result.strip())
-                    if not target_btn:
-                        self.log("未找到匹配的按钮", level="WARNING")
-                        return False
-                    await self.request_callback_answer(
-                        client, message.chat.id, message.id, target_btn.callback_data
-                    )
-                    return True
-            else:
-                self.log(f"忽略类型: {type(reply_markup)}", level="WARNING")
-        else:
-            self.log("未检测到按钮", level="WARNING")
+                    return False
+                image_buffer: BinaryIO = await self.app.download_media(
+                    message.photo.file_id, in_memory=True
+                )
+                image_buffer.seek(0)
+                image_bytes = image_buffer.read()
+                options = list(option_to_btn)
+                result_index = await choose_option_by_image(
+                    image_bytes,
+                    "选择正确的选项",
+                    list(enumerate(options)),
+                    client=ai_client,
+                )
+                result = options[result_index]
+                self.log(f"选择结果为: {result}")
+                target_btn = option_to_btn.get(result.strip())
+                if not target_btn:
+                    self.log("未找到匹配的按钮", level="WARNING")
+                    return False
+                await self.request_callback_answer(
+                    self.app,
+                    message.chat.id,
+                    message.id,
+                    target_btn.callback_data,
+                )
+                return True
+        return False
+
+    async def wait_for(self, chat: SignChatV3, action: ActionT, timeout=10):
+        self.log(f"处理动作: {action}")
+        if isinstance(action, SendTextAction):
+            return await self.send_message(chat.chat_id, action.text, chat.delete_after)
+        elif isinstance(action, SendDiceAction):
+            return await self.send_dice(chat.chat_id, action.dice, chat.delete_after)
+        self.context.waiter.add(chat.chat_id)
+        start = time.perf_counter()
+        self.log(f"等待处理动作: {action}")
+        last_message = None
+        while time.perf_counter() - start < timeout:
+            await asyncio.sleep(0.3)
+            messages = self.context.chat_messages.get(chat.chat_id)
+            if not messages:
+                continue
+            # 暂无新消息
+            if messages[-1] == last_message:
+                continue
+            last_message = messages[-1]
+            for message in messages:
+                ok = False
+                if isinstance(action, ClickKeyboardByTextAction):
+                    ok = await self._click_keyboard_by_text(action, message)
+                elif isinstance(action, ReplyByCalculationProblemAction):
+                    ok = await self._reply_by_calculation_problem(action, message)
+                elif isinstance(action, ChooseOptionByImageAction):
+                    ok = await self._choose_option_by_image(action, message)
+                if ok:
+                    self.context.waiter.sub(message.chat.id)
+                    # 这里移除了该消息，消息列表不可再迭代
+                    self.context.chat_messages[chat.chat_id].remove(message)
+                    return None
+                self.log(f"忽略消息: {readable_message(message)}")
+        self.log(f"等待超时: \nchat: \n{chat} \naction: {action}", level="WARNING")
+        return None
 
     async def request_callback_answer(
         self,
@@ -823,7 +1024,7 @@ class UserSigner(BaseUserWorker):
                 print_to_user(f"{message.date}: {message.text}")
 
 
-class UserMonitor(BaseUserWorker):
+class UserMonitor(BaseUserWorker[MonitorConfig]):
     _workdir = ".monitor"
     _tasks_dir = "monitors"
     cfg_cls = MonitorConfig
@@ -835,7 +1036,7 @@ class UserMonitor(BaseUserWorker):
         if not chat_id.startswith("@"):
             chat_id = int(chat_id)
         rules = ["exact", "contains", "regex", "all"]
-        while rule := input_(f"匹配规则({', '.join(rules)}): ") or "exact":
+        while rule := (input_(f"匹配规则({', '.join(rules)}): ") or "exact"):
             if rule in rules:
                 break
             print_to_user("不存在的规则, 请重新输入!")
@@ -850,11 +1051,12 @@ class UserMonitor(BaseUserWorker):
             )
             or None
         )
+        always_ignore_me = input_("总是忽略自己发送的消息（y/N）: ").lower() == "y"
         if from_user_ids:
             from_user_ids = [
                 i if i.startswith("@") else int(i) for i in from_user_ids.split(",")
             ]
-        default_send_text = input_("默认发送文本: ") or None
+        default_send_text = input_("默认发送文本（不需要则回车）: ") or None
         ai_reply = False
         ai_prompt = None
         use_ai_reply = input_("是否使用AI进行回复(y/N): ") or "n"
@@ -871,30 +1073,67 @@ class UserMonitor(BaseUserWorker):
                 input_("从消息中提取发送文本的正则表达式（不需要则直接回车）: ") or None
             )
 
-        delete_after = (
-            input_(
-                "等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: "
+        if default_send_text or ai_reply or send_text_search_regex:
+            delete_after = (
+                input_(
+                    "发送消息后等待N秒进行删除（'0'表示立即删除, 不需要删除直接回车）， N: "
+                )
+                or None
             )
-            or None
-        )
-        if delete_after:
-            delete_after = int(delete_after)
-        forward_to_chat_id = (input_("转发消息到该聊天ID，默认为消息来源：")).strip()
-        if forward_to_chat_id and not forward_to_chat_id.startswith("@"):
-            forward_to_chat_id = int(forward_to_chat_id)
+            if delete_after:
+                delete_after = int(delete_after)
+            forward_to_chat_id = (
+                input_("转发消息到该聊天ID，默认为消息来源：")
+            ).strip()
+            if forward_to_chat_id and not forward_to_chat_id.startswith("@"):
+                forward_to_chat_id = int(forward_to_chat_id)
+        else:
+            delete_after = None
+            forward_to_chat_id = None
+
         push_via_server_chan = (
             input_("是否通过Server酱推送消息(y/N): ") or "n"
         ).lower() == "y"
-        server_chan_send_key = (
-            input_("Server酱的SendKey（不填将从环境变量`SERVER_CHAN_SEND_KEY`读取: ")
-            or None
+        server_chan_send_key = None
+        if push_via_server_chan:
+            server_chan_send_key = (
+                input_(
+                    "Server酱的SendKey（不填将从环境变量`SERVER_CHAN_SEND_KEY`读取）: "
+                )
+                or None
+            )
+
+        forward_to_external = (
+            input_("是否需要转发到外部（UDP, Http）(y/N): ").lower() == "y"
         )
+        external_forwards = None
+        if forward_to_external:
+            external_forwards = []
+            if input_("是否需要转发到UDP(y/N): ").lower() == "y":
+                addr = input_("请输入UDP服务器地址和端口（形如`127.0.0.1:1234`）: ")
+                host, port = addr.split(":")
+                external_forwards.append(
+                    {
+                        "host": host,
+                        "port": int(port),
+                    }
+                )
+
+            if input_("是否需要转发到Http(y/N): ").lower() == "y":
+                url = input_("请输入Http地址（形如`http://127.0.0.1:1234`）: ")
+                external_forwards.append(
+                    {
+                        "url": url,
+                    }
+                )
+
         return MatchConfig.model_validate(
             {
                 "chat_id": chat_id,
                 "rule": rule,
                 "rule_value": rule_value,
                 "from_user_ids": from_user_ids,
+                "always_ignore_me": always_ignore_me,
                 "default_send_text": default_send_text,
                 "ai_reply": ai_reply,
                 "ai_prompt": ai_prompt,
@@ -903,6 +1142,7 @@ class UserMonitor(BaseUserWorker):
                 "forward_to_chat_id": forward_to_chat_id,
                 "push_via_server_chan": push_via_server_chan,
                 "server_chan_send_key": server_chan_send_key,
+                "external_forwards": external_forwards,
             }
         )
 
@@ -927,11 +1167,57 @@ class UserMonitor(BaseUserWorker):
             i += 1
         return MonitorConfig(match_cfgs=match_cfgs)
 
+    @classmethod
+    async def udp_forward(cls, f: UDPForward, message: Message):
+        data = str(message).encode("utf-8")
+        loop = asyncio.get_running_loop()
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: _UDPProtocol(), remote_addr=(f.host, f.port)
+        )
+        try:
+            transport.sendto(data)
+        finally:
+            transport.close()
+
+    @classmethod
+    async def http_api_callback(cls, f: HttpCallback, message: Message):
+        headers = f.headers or {}
+        headers.update({"Content-Type": "application/json"})
+        content = str(message).encode("utf-8")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                str(f.url),
+                content=content,
+                headers=headers,
+                timeout=10,
+            )
+
+    async def forward_to_external(self, match_cfg: MatchConfig, message: Message):
+        if not match_cfg.external_forwards:
+            return
+        for forward in match_cfg.external_forwards:
+            self.log(f"转发消息至{forward}")
+            if isinstance(forward, UDPForward):
+                asyncio.create_task(
+                    self.udp_forward(
+                        forward,
+                        message,
+                    )
+                )
+            elif isinstance(forward, HttpCallback):
+                asyncio.create_task(
+                    self.http_api_callback(
+                        forward,
+                        message,
+                    )
+                )
+
     async def on_message(self, client, message: Message):
         for match_cfg in self.config.match_cfgs:
             if not match_cfg.match(message):
                 continue
             self.log(f"匹配到监控项：{match_cfg}")
+            await self.forward_to_external(match_cfg, message)
             try:
                 send_text = await self.get_send_text(match_cfg, message)
                 if not send_text:
@@ -984,3 +1270,19 @@ class UserMonitor(BaseUserWorker):
         async with self.app:
             self.log("开始监控...")
             await idle()
+
+
+class _UDPProtocol(asyncio.DatagramProtocol):
+    """内部使用的UDP协议处理类"""
+
+    def __init__(self):
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        pass  # 不需要处理接收的数据
+
+    def error_received(self, exc):
+        print(f"UDP error received: {exc}")

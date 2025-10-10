@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Optional
 
 import click
 from click import Context, HelpFormatter
@@ -39,7 +40,9 @@ class AliasedGroup(click.Group):
                 formatter.write_text(f"{k} -> {v}")
 
 
-def get_signer(task_name, ctx_obj: dict):
+def get_signer(
+    task_name, ctx_obj: dict, loop: Optional[asyncio.AbstractEventLoop] = None
+):
     signer = UserSigner(
         task_name=task_name,
         account=ctx_obj["account"],
@@ -48,6 +51,7 @@ def get_signer(task_name, ctx_obj: dict):
         workdir=ctx_obj["workdir"],
         session_string=ctx_obj["session_string"],
         in_memory=ctx_obj["in_memory"],
+        loop=loop,
     )
     return signer
 
@@ -198,7 +202,7 @@ def logout(obj):
 
 
 @tg_signer.command(help="根据任务配置运行签到")
-@click.argument("task_name", nargs=1, default="my_sign")
+@click.argument("task_names", nargs=-1)
 @click.option(
     "--num-of-dialogs",
     "-n",
@@ -208,9 +212,16 @@ def logout(obj):
     help="获取最近N个对话, 请确保想要签到的对话在最近N个对话内",
 )
 @click.pass_obj
-def run(obj, task_name, num_of_dialogs):
-    signer = get_signer(task_name, obj)
-    signer.app_run(signer.run(num_of_dialogs))
+def run(obj, task_names, num_of_dialogs):
+    if len(task_names) < 1:
+        raise click.UsageError("At least one task name is required")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    coros = []
+    for task_name in task_names:
+        signer = get_signer(task_name, obj, loop=loop)
+        coros.append(signer.run(num_of_dialogs))
+    loop.run_until_complete(asyncio.gather(*coros))
 
 
 @tg_signer.command(help="运行一次签到任务，即使该签到任务今日已执行过")
@@ -230,7 +241,7 @@ def run_once(obj, task_name, num_of_dialogs):
     signer.app_run(signer.run_once(num_of_dialogs))
 
 
-@tg_signer.command(help='发送一次消息, 请确保当前会话已经"见过"该`chat_id`')
+@tg_signer.command(help='发送一次文本消息, 请确保当前会话已经"见过"该`chat_id`')
 @click.argument(
     "chat_id",
     type=int,
@@ -248,6 +259,28 @@ def send_text(obj, chat_id, text, delete_after=None):
     singer = get_signer(None, obj)
     click.echo("将发送单次消息")
     singer.app_run(singer.send_text(chat_id, text, delete_after))
+
+
+@tg_signer.command(
+    help="发送一次DICE消息, 请确保当前会话已经\"见过\"该`chat_id`。\n注意，`emoji`应该是'🎲', '🎯', '🏀', '⚽', '🎳'或'🎰'之一"
+)
+@click.argument(
+    "chat_id",
+    type=int,
+)
+@click.argument("emoji")
+@click.option(
+    "--delete-after",
+    "delete_after",
+    type=int,
+    required=False,
+    help="秒, 发送消息后进行删除, 默认不删除, '0'表示立即删除.",
+)
+@click.pass_obj
+def send_dice(obj, chat_id, emoji, delete_after=None):
+    singer = get_signer(None, obj)
+    click.echo("将发送单次DICE消息")
+    singer.app_run(singer.send_dice_cli(chat_id, emoji, delete_after))
 
 
 @tg_signer.command(help="重新配置")
@@ -399,13 +432,11 @@ def list_schedule_messages(obj, chat_id):
 def multi_run(obj, accounts, task_name, num_of_dialogs):
     logger = logging.getLogger("tg-signer")
     logger.info(f"开始使用一套配置({task_name})同时运行多个账号..")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     coros = []
     for account in accounts:
         obj["account"] = account
-        signer = get_signer(
-            task_name,
-            obj,
-        )
+        signer = get_signer(task_name, obj, loop=loop)
         coros.append(signer.run(num_of_dialogs))
-    loop = asyncio.get_event_loop()
     loop.run_until_complete(asyncio.gather(*coros))
