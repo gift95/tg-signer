@@ -26,28 +26,13 @@ pip install -U tg-signer
 ```sh
 pip install "tg-signer[speedup]"
 ```
+#### Docker
 
-启用 YAML 配置支持：
 
+未上传直接使用的镜像，可以自行build镜像，见 [docker](./docker) 目录下的Dockerfile和 [README](./docker/README.md) 。
 ```sh
-pip install "tg-signer[yaml]"
+docker pull gift95/tg-signer:latest
 ```
-#### WebUI
-tg-signer附带了一个WebUI，安装命令:
-```sh
-pip install "tg-signer[gui]"
-```
-
-![webgui](./assets/webui.jpeg)
-
-
-### Docker
-
-#### GitHub Container Registry
-在 GitHub Container Registry 提供了两种预构建镜像：`ghcr.io/amchii/tg-signer:<tag>`（CLI）和 `ghcr.io/amchii/tg-signer:<tag>-webui`（CLI + WebUI）。
-
-#### 本地
-如果需要自行构建镜像，本地 build 方式仍然保留，见 [docker](./docker) 目录下的 Dockerfile 和 [README](./docker/README.md) 。
 
 ### 使用方法
 
