@@ -9,12 +9,13 @@
 - 调用AI进行图片识别并点击键盘
 - 个人、群组、频道消息监控、转发与自动回复
 - 根据配置执行动作流
+- 自动化规则引擎（message/timer/startup 触发 + handler 链）
 
   **...**
 
 ### 安装
 
-需要Python3.9及以上
+需要Python3.10及以上
 
 ```sh
 pip install -U tg-signer
@@ -29,7 +30,6 @@ pip install "tg-signer[speedup]"
 
 
 未上传直接使用的镜像，可以自行build镜像，见 [docker](./docker) 目录下的Dockerfile和 [README](./docker/README.md) 。
-=======
 ```sh
 docker pull gift95/tg-signer:latest
 ```
@@ -49,7 +49,9 @@ Options:
   -l, --log-level [debug|info|warn|error]
                                   日志等级, `debug`, `info`, `warn`, `error`
                                   [default: info]
-  --log-file PATH                 日志文件路径, 可以是相对路径  [default: tg-signer.log]
+  --log-file PATH                 日志文件路径, 可以是相对路径  [default: logs/tg-
+                                  signer.log]
+  --log-dir PATH                  日志文件目录, 可以是相对路径  [default: logs]
   -p, --proxy TEXT                代理地址, 例如: socks5://127.0.0.1:1080,
                                   会覆盖环境变量`TG_PROXY`的值  [env var: TG_PROXY]
   --session_dir PATH              存储TG Sessions的目录, 可以是相对路径  [default: .]
@@ -68,17 +70,25 @@ Commands:
   import                  导入配置，默认为从终端读取。
   list                    列出已有配置
   list-members            查询聊天（群或频道）的成员, 频道需要管理员权限
+  list-sign-records       列出最近N条签到记录
+  list-topics             列出群组话题ID（message_thread_id）
   list-schedule-messages  显示已配置的定时消息
+  llm-config              配置大模型API
   login                   登录账号（用于获取session）
+  migrate-sign-records    将签到记录从 JSON 迁移到 SQLite（默认保留原...
   logout                  登出账号并删除session文件
+  automation              配置和运行自动化规则（推荐，覆盖monitor能力）
   monitor                 配置和运行监控
   multi-run               使用一套配置同时运行多个账号
   reconfig                重新配置
   run                     根据任务配置运行签到
   run-once                运行一次签到任务，即使该签到任务今日已执行过
   schedule-messages       批量配置Telegram自带的定时发送消息功能
-  send-text               发送一次消息, 请确保当前会话已经"见过"该`chat_id`
+  send-dice               发送一次DICE消息, 请确保当前会话已经"见过"该`chat_id`。...
+  send-text               发送一次文本消息, 请确保当前会话已经"见过"该`chat_id`
   version                 Show version
+  webgui                  启动一个WebGUI（需要通过`pip install "tg-signer[gui]"`安装相关依赖）
+
 ```
 
 例如:
@@ -87,14 +97,35 @@ Commands:
 tg-signer run
 tg-signer run my_sign  # 不询问，直接运行'my_sign'任务
 tg-signer run-once my_sign  # 直接运行一次'my_sign'任务
+tg-signer list-sign-records linuxdo -n 5  # 查看任务 linuxdo 最近 5 条签到记录
+tg-signer migrate-sign-records  # 将.signer/signs 下的签到记录迁移到 SQLite
 tg-signer send-text 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本
+tg-signer send-text @neo /test  # 向username为'@neo'的聊天发送'/test'文本
+tg-signer send-text --message-thread-id 1 -- -1003763902761 checkin  # 发送到群组话题(message_thread_id=1)
 tg-signer send-text -- -10006758812 浇水  # 对于负数需要使用POSIX风格，在短横线'-'前方加上'--'
 tg-signer send-text --delete-after 1 8671234001 /test  # 向chat_id为'8671234001'的聊天发送'/test'文本, 并在1秒后删除发送的消息
 tg-signer list-members --chat_id -1001680975844 --admin  # 列出频道的管理员
+tg-signer list-topics --chat_id -1003763902761 --limit 50  # 列出群组话题及message_thread_id
 tg-signer schedule-messages --crontab '0 0 * * *' --next-times 10 -- -1001680975844 你好  # 在未来10天的每天0点向'-1001680975844'发送消息
+tg-signer schedule-messages --crontab '0 0 * * *' --next-times 3 --message-thread-id 1 -- -1003763902761 你好  # 配置群组话题的定时消息
+tg-signer automation init my_auto  # 初始化自动化模板
+tg-signer automation run my_auto  # 运行自动化任务
 tg-signer monitor run  # 配置个人、群组、频道消息监控与自动回复
 tg-signer multi-run -a account_a -a account_b same_task  # 使用'same_task'的配置同时运行'account_a'和'account_b'两个账号
+tg-signer webgui --auth-code averycomplexcode  # 启动一个WebGUI
 ```
+
+### 自动化规则（automation）
+
+推荐使用 `tg-signer automation` 统一管理自动化规则（覆盖 monitor 能力）。
+
+```sh
+tg-signer automation init my_auto
+# 编辑 .signer/automations/my_auto/config.json
+tg-signer automation run my_auto
+```
+
+更多详细使用说明与示例见：`docs/automation_usage.md`
 
 ### 配置代理（如有需要）
 
@@ -113,11 +144,32 @@ tg-signer login
 ```
 
 根据提示输入手机号码和验证码进行登录并获取最近的聊天列表，确保你想要签到的聊天在列表内。
+签到任务里的`chat_id`同时支持整数ID和以`@`开头的username，例如`@neo`。
+对于论坛群组，登录输出中会额外打印每个话题的 `message_thread_id`，可直接用于 `--message-thread-id`。
+
+### 时区
+
+调度相关命令（如 `run` 和 `schedule-messages`）会按以下顺序解析时区：
+
+1. 环境变量 `TZ`
+2. Python 识别到的本地时区
+3. 默认回退到 `Asia/Shanghai`
+
+如果你需要按特定时区计算下次执行时间，直接在运行前设置 `TZ` 即可。
+
+### 获取群组话题 ID
+
+```sh
+tg-signer list-topics --chat_id -1003763902761
+```
+
+会输出该论坛群组可见话题的 `message_thread_id`、标题及状态，便于配置签到到指定话题。
 
 ### 发送一次消息
 
 ```sh
 tg-signer send-text 8671234001 hello  # 向chat_id为'8671234001'的聊天发送'hello'文本
+tg-signer send-text @neo hello  # 向username为'@neo'的聊天发送'hello'文本
 ```
 
 ### 运行签到任务
@@ -139,9 +191,11 @@ tg-signer run linuxdo
 ```
 开始配置任务<linuxdo>
 第1个签到
-一. Chat ID（登录时最近对话输出中的ID）: 7661096533
+一. Chat ID（登录时最近对话输出中的ID或@username）: 7661096533
 二. Chat名称（可选）: jerry bot
-三. 开始配置<动作>，请按照实际签到顺序配置。
+三. 是否发送到话题（message_thread_id）？(y/N)：y
+四. message_thread_id: 1
+五. 开始配置<动作>，请按照实际签到顺序配置。
   1: 发送普通文本
   2: 发送Dice类型的emoji
   3: 根据文本点击键盘
@@ -169,10 +223,11 @@ tg-signer run linuxdo
 2. 输入要发送的骰子（如 🎲, 🎯）: 🎲
 3. 是否继续添加动作？(y/N)：n
 在运行前请通过环境变量正确设置`OPENAI_API_KEY`, `OPENAI_BASE_URL`。默认模型为"gpt-4o", 可通过环境变量`OPENAI_MODEL`更改。
-四. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 10
+六. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 10
 ╔════════════════════════════════════════════════╗
 ║ Chat ID: 7661096533                            ║
 ║ Name: jerry bot                                ║
+║ Message Thread ID: 1                           ║
 ║ Delete After: 10                               ║
 ╟────────────────────────────────────────────────╢
 ║ Actions Flow:                                  ║
@@ -190,6 +245,7 @@ tg-signer run linuxdo
 ```
 
 ### 配置与运行监控
+说明：monitor 为 legacy 功能，推荐使用 `tg-signer automation` 统一管理自动化规则。
 
 ```sh
 tg-signer monitor run my_monitor
@@ -220,7 +276,8 @@ tg-signer monitor run my_monitor
 4. 只匹配来自特定用户ID的消息（多个用逗号隔开, 匹配所有用户直接回车）: 61244351
 5. 默认发送文本:
 6. 从消息中提取发送文本的正则表达式: 参与关键词：「(?P<keyword>(.*?))」\n
-7. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 5
+7. 发送文本模板（可用{extracted}/{group1}/命名分组；不需要则直接回车）: 我要参与 {keyword}
+8. 等待N秒后删除签到消息（发送消息后等待进行删除, '0'表示立即删除, 不需要删除直接回车）, N: 5
 继续配置？(y/N)：y
 
 配置第3个监控项
@@ -263,8 +320,10 @@ tg-signer monitor run my_monitor
 
     5. 可以设置默认发布文本， 即只要匹配到消息即默认发送该文本
 
-    6. 提取发布文本的正则，例如 "参与关键词：「(.*?)」\n" ，注意用括号`(...)` 捕获要提取的文本，
-       可以捕获第3点示例消息的关键词"我要抽奖"并自动发送
+    6. 提取发布文本的正则，例如 "参与关键词：「(?P<keyword>.*?)」\n" ，注意用括号`(...)` 捕获要提取的文本，
+       可以捕获第3点示例消息的关键词"我要抽奖"并自动发送。若配置了发送文本模板，可用 `{extracted}` 或
+       `{group1}` 引用第一个捕获组，也可用 `{keyword}` 引用命名分组，例如模板 `我要参与 {keyword}` 会发送
+       `我要参与 我要抽奖`。
 
 3. 消息Message结构参考:
 
@@ -365,77 +424,9 @@ tg-signer monitor run my_monitor
 [INFO] [tg-signer] 2024-10-25 12:30:08,260 core.py 232 Message「我要抽奖」 to -4573702599 deleted!
 ```
 
-
-
 ### 版本变动日志
 
-#### 0.8.0
-- 支持单个账号同一进程内同时运行多个任务
-
-#### 0.7.6
-- fix: 监控多个聊天时消息转发至每个聊天 (#55)
-
-#### 0.7.5
-- 捕获并记录执行任务期间的所有RPC错误
-- bump kurigram version to 2.2.7
-
-#### 0.7.4
-- 执行多个action时，支持固定时间间隔
-- 通过`crontab`配置定时执行时不再限制每日执行一次
-
-#### 0.7.2
-- 支持将消息转发至外部端点，通过：
-  - UDP
-  - HTTP
-- 将kurirogram替换为kurigram
-
-#### 0.7.0
-- 支持每个聊天会话按序执行多个动作，动作类型：
-  - 发送文本
-  - 发送骰子
-  - 按文本点击键盘
-  - 通过图片选择选项
-  - 通过计算题回复
-
-#### 0.6.6
-- 增加对发送DICE消息的支持
-
-#### 0.6.5
-- 修复使用同一套配置运行多个账号时签到记录共用的问题
-
-#### 0.6.4
-- 增加对简单计算题的支持
-- 改进签到配置和消息处理
-
-#### 0.6.3
-- 兼容kurigram 2.1.38版本的破坏性变更
-> Remove coroutine param from run method [a7afa32](https://github.com/KurimuzonAkuma/pyrogram/commit/a7afa32df208333eecdf298b2696a2da507bde95)
-
-
-#### 0.6.2
-- 忽略签到时发送消息失败的聊天
-
-#### 0.6.1
-- 支持点击按钮文本后继续进行图片识别
-
-#### 0.6.0
-- Signer支持通过crontab定时
-- Monitor匹配规则添加`all`支持所有消息
-- Monitor支持匹配到消息后通过server酱推送
-- Signer新增`multi-run`用于使用一套配置同时运行多个账号
-
-#### 0.5.2
-- Monitor支持配置AI进行消息回复
-- 增加批量配置「Telegram自带的定时发送消息功能」的功能
-
-#### 0.5.1
-- 添加`import`和`export`命令用于导入导出配置
-
-#### 0.5.0
-- 根据配置的文本点击键盘
-- 调用AI识别图片点击键盘
-
-
+版本变动日志已移至 [CHANGELOG.md](CHANGELOG.md#版本变动日志)。
 
 ### 配置与数据存储位置
 
@@ -443,15 +434,28 @@ tg-signer monitor run my_monitor
 
 ```
 .signer
-├── latest_chats.json  # 获取的最近对话
-├── me.json  # 个人信息
+├── .openai_config.json  # 可选，大模型配置
+├── data.sqlite3  # SQLite 签到记录库
 ├── monitors  # 监控
 │   ├── my_monitor  # 监控任务名
 │       └── config.json  # 监控配置
+├── users
+│   └── 123456789
+│       ├── latest_chats.json  # 获取的最近对话
+│       └── me.json  # 个人信息
+├── automations  # 自动化规则
+│   ├── my_auto  # 自动化任务名
+│       ├── config.json  # 自动化配置
+│       └── state.json  # 运行状态
 └── signs  # 签到任务
     └── linuxdo  # 签到任务名
         ├── config.json  # 签到配置
-        └── sign_record.json  # 签到记录
+        ├── 123456789
+        │   └── sign_record.json  # 旧版 JSON 签到记录（兼容迁移）
+        └── sign_record.json  # 更旧版 JSON 路径（兼容迁移）
 
-3 directories, 4 files
 ```
+
+迁移到 SQLite 后，新的签到记录只写入 `data.sqlite3`，但仍兼容读取旧
+`sign_record.json`。当运行任务时如果检测到旧 JSON，程序会输出提示并尝试将该任务
+的历史记录自动导入 SQLite。

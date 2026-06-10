@@ -1,11 +1,14 @@
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import click
 from click import Context, HelpFormatter
 
+from tg_signer.config import parse_chat_id_or_username
 from tg_signer.core import UserSigner, get_proxy
+from tg_signer.sign_record_store import SignRecordStore
 
 
 class AliasedGroup(click.Group):
@@ -69,10 +72,18 @@ def get_signer(
 @click.option(
     "--log-file",
     "log_file",
-    default="tg-signer.log",
+    default="logs/tg-signer.log",
     show_default=True,
     type=click.Path(),
     help="日志文件路径, 可以是相对路径",
+)
+@click.option(
+    "--log-dir",
+    "log_dir",
+    default="logs",
+    show_default=True,
+    type=click.Path(),
+    help="日志文件目录, 可以是相对路径",
 )
 @click.option(
     "--proxy",
@@ -132,6 +143,7 @@ def tg_signer(
     ctx: click.Context,
     log_level: str,
     log_file: str,
+    log_dir: str,
     proxy: str,
     session_dir: str,
     account: str,
@@ -141,7 +153,7 @@ def tg_signer(
 ):
     from tg_signer.logger import configure_logger
 
-    logger = configure_logger(log_level, log_file)
+    logger = configure_logger(log_level=log_level, log_dir=log_dir, log_file=log_file)
     ctx.ensure_object(dict)
     proxy = get_proxy(proxy)
     if ctx.invoked_subcommand in [
@@ -177,6 +189,39 @@ def version():
 @click.pass_obj
 def list_(obj):
     return UserSigner(workdir=obj["workdir"]).list_()
+
+
+@tg_signer.command(name="list-sign-records", help="列出最近N条签到记录")
+@click.argument("task_name", required=False)
+@click.option(
+    "--limit",
+    "-n",
+    default=10,
+    show_default=True,
+    type=int,
+    help="返回最近N条记录",
+)
+@click.option(
+    "--user-id",
+    "user_id",
+    default=None,
+    help="按 user_id 过滤",
+)
+@click.pass_obj
+def list_sign_records(obj, task_name: str | None, limit: int, user_id: str | None):
+    store = SignRecordStore(obj["workdir"])
+    records = store.list_recent_records(
+        limit=limit, task_name=task_name, user_id=user_id
+    )
+    if not records:
+        click.echo(
+            "暂无 SQLite 签到记录。若存在旧 sign_record.json，请先运行任务触发懒迁移或执行 `tg-signer migrate-sign-records`。"
+        )
+        return
+    for record in records:
+        click.echo(
+            f"{record.signed_at} | task={record.task_name} | user={record.user_id} | date={record.sign_date} | source={record.source}"
+        )
 
 
 @tg_signer.command(help="登录账号（用于获取session）")
@@ -244,7 +289,7 @@ def run_once(obj, task_name, num_of_dialogs):
 @tg_signer.command(help='发送一次文本消息, 请确保当前会话已经"见过"该`chat_id`')
 @click.argument(
     "chat_id",
-    type=int,
+    type=str,
 )
 @click.argument("text")
 @click.option(
@@ -254,11 +299,26 @@ def run_once(obj, task_name, num_of_dialogs):
     required=False,
     help="秒, 发送消息后进行删除, 默认不删除, '0'表示立即删除.",
 )
+@click.option(
+    "--message-thread-id",
+    "message_thread_id",
+    type=int,
+    required=False,
+    help="话题ID（message_thread_id）, 不填则发送到非话题会话",
+)
 @click.pass_obj
-def send_text(obj, chat_id, text, delete_after=None):
+def send_text(obj, chat_id, text, delete_after=None, message_thread_id=None):
     singer = get_signer(None, obj)
+    chat_id = parse_chat_id(chat_id)
     click.echo("将发送单次消息")
-    singer.app_run(singer.send_text(chat_id, text, delete_after))
+    singer.app_run(
+        singer.send_text(
+            chat_id,
+            text,
+            delete_after,
+            message_thread_id=message_thread_id,
+        )
+    )
 
 
 @tg_signer.command(
@@ -266,7 +326,7 @@ def send_text(obj, chat_id, text, delete_after=None):
 )
 @click.argument(
     "chat_id",
-    type=int,
+    type=str,
 )
 @click.argument("emoji")
 @click.option(
@@ -276,11 +336,26 @@ def send_text(obj, chat_id, text, delete_after=None):
     required=False,
     help="秒, 发送消息后进行删除, 默认不删除, '0'表示立即删除.",
 )
+@click.option(
+    "--message-thread-id",
+    "message_thread_id",
+    type=int,
+    required=False,
+    help="话题ID（message_thread_id）, 不填则发送到非话题会话",
+)
 @click.pass_obj
-def send_dice(obj, chat_id, emoji, delete_after=None):
+def send_dice(obj, chat_id, emoji, delete_after=None, message_thread_id=None):
     singer = get_signer(None, obj)
+    chat_id = parse_chat_id(chat_id)
     click.echo("将发送单次DICE消息")
-    singer.app_run(singer.send_dice_cli(chat_id, emoji, delete_after))
+    singer.app_run(
+        singer.send_dice_cli(
+            chat_id,
+            emoji,
+            delete_after,
+            message_thread_id=message_thread_id,
+        )
+    )
 
 
 @tg_signer.command(help="重新配置")
@@ -289,6 +364,15 @@ def send_dice(obj, chat_id, emoji, delete_after=None):
 def reconfig(obj, task_name):
     signer = UserSigner(task_name=task_name, workdir=obj["workdir"])
     return signer.reconfig()
+
+
+def parse_chat_id(chat_id: str):
+    if chat_id.startswith("@"):
+        return parse_chat_id_or_username(chat_id)
+    try:
+        return parse_chat_id_or_username(chat_id)
+    except ValueError as e:
+        raise click.UsageError("chat_id为username时必须以@开头") from e
 
 
 @tg_signer.command(help="查询聊天（群或频道）的成员, 频道需要管理员权限")
@@ -310,15 +394,31 @@ def reconfig(obj, task_name):
 @click.pass_obj
 def list_members(obj, chat_id: str, query: str, admin, limit):
     signer = get_signer(None, obj)
-    chat_id = chat_id.strip()
-    if chat_id.startswith("@"):
-        chat_id = chat_id[1:]
-    else:
-        try:
-            chat_id = int(chat_id)
-        except ValueError:
-            raise click.UsageError("chat_id为username时必须以@开头")
+    chat_id = parse_chat_id(chat_id)
     signer.app_run(signer.list_members(chat_id, query, admin=admin, limit=limit))
+
+
+@tg_signer.command(help="列出群组话题ID（message_thread_id）")
+@click.option(
+    "--chat_id",
+    "chat_id",
+    required=True,
+    help="整数id或字符串username, username须以@开头",
+)
+@click.option(
+    "--limit",
+    "-l",
+    "limit",
+    default=20,
+    show_default=True,
+    type=int,
+    help="最多返回的话题数量",
+)
+@click.pass_obj
+def list_topics(obj, chat_id: str, limit: int):
+    signer = get_signer(None, obj)
+    chat_id = parse_chat_id(chat_id)
+    signer.app_run(signer.list_topics(chat_id, limit=limit))
 
 
 @tg_signer.command(
@@ -362,7 +462,7 @@ def import_(obj, task_name: str, file: str = None):
 @tg_signer.command(help="批量配置Telegram自带的定时发送消息功能")
 @click.argument(
     "chat_id",
-    type=int,
+    type=str,
 )
 @click.argument("text")
 @click.option(
@@ -391,22 +491,40 @@ def import_(obj, task_name: str, file: str = None):
     show_default=True,
     help="加入随机秒数，会应用于每个定时消息",
 )
+@click.option(
+    "--message-thread-id",
+    "message_thread_id",
+    type=int,
+    required=False,
+    help="话题ID（message_thread_id）, 不填则发送到非话题会话",
+)
 @click.pass_obj
-def schedule_messages(obj, chat_id, text, crontab, next_times, random_seconds):
+def schedule_messages(
+    obj, chat_id, text, crontab, next_times, random_seconds, message_thread_id
+):
     signer = get_signer(None, obj)
+    chat_id = parse_chat_id(chat_id)
     signer.app_run(
-        signer.schedule_messages(chat_id, text, crontab, next_times, random_seconds)
+        signer.schedule_messages(
+            chat_id,
+            text,
+            crontab,
+            next_times,
+            random_seconds,
+            message_thread_id=message_thread_id,
+        )
     )
 
 
 @tg_signer.command(help="显示已配置的定时消息")
-@click.argument("chat_id", type=int)
+@click.argument("chat_id", type=str)
 @click.pass_obj
 def list_schedule_messages(obj, chat_id):
     logging.root.setLevel(
         level=logging.WARNING,
     )
     signer = get_signer(None, obj)
+    chat_id = parse_chat_id(chat_id)
     signer.app_run(signer.get_schedule_messages(chat_id))
 
 
@@ -440,3 +558,83 @@ def multi_run(obj, accounts, task_name, num_of_dialogs):
         signer = get_signer(task_name, obj, loop=loop)
         coros.append(signer.run(num_of_dialogs))
     loop.run_until_complete(asyncio.gather(*coros))
+
+
+@tg_signer.command(name="llm-config", help="配置大模型API")
+@click.pass_obj
+def llm_config(obj):
+    from tg_signer.ai_tools import OpenAIConfigManager
+
+    cfg_manager = OpenAIConfigManager(obj["workdir"])
+    cfg_manager.ask_for_config()
+
+
+@tg_signer.command(
+    name="migrate-sign-records",
+    help="将签到记录从 JSON 迁移到 SQLite（默认保留原 sign_record.json）",
+)
+@click.option(
+    "--legacy-user-id",
+    "legacy_user_id",
+    default=None,
+    help="为旧版 signs/<task>/sign_record.json 指定 user_id；未指定时会尝试自动推断",
+)
+@click.option(
+    "--delete-json",
+    "delete_json",
+    default=False,
+    is_flag=True,
+    help="迁移成功后删除原 sign_record.json 文件",
+)
+@click.pass_obj
+def migrate_sign_records(obj, legacy_user_id: str | None, delete_json: bool):
+    store = SignRecordStore(obj["workdir"])
+    summary = store.migrate_all_json_records(
+        legacy_user_id=legacy_user_id,
+        remove_files=delete_json,
+        account=obj["account"],
+    )
+    click.echo(f"SQLite 文件: {store.db_path}")
+    click.echo(f"迁移文件数: {summary.migrated_files}")
+    click.echo(f"迁移记录数: {summary.migrated_records}")
+    if delete_json:
+        click.echo(f"删除 JSON 文件数: {summary.removed_files}")
+    if summary.skipped_files:
+        click.echo("以下文件未迁移（缺少 user_id，且无法自动推断）:")
+        for path in summary.skipped_files:
+            click.echo(f"  - {path}")
+
+
+@tg_signer.command(
+    name="webgui",
+    help="启动一个WebGUI（需要通过`pip install tg-signer[gui]`安装相关依赖）",
+)
+@click.option("--host", "-H", "host", default="127.0.0.1", help="监听地址")
+@click.option("--port", "-P", "port", default=8080, help="监听端口")
+@click.option(
+    "--storage-secret",
+    "-S",
+    "storage_secret",
+    default=None,
+    show_default=True,
+    help="存储密钥，若不输入则每次启动会使用随机字符串",
+)
+@click.option(
+    "--auth-code",
+    "auth_code",
+    default=None,
+    show_default=True,
+    envvar="TG_SIGNER_GUI_AUTHCODE",
+    help="授权码，也可通过环境变量`TG_SIGNER_GUI_AUTHCODE`设置。若存在则访问界面时需要正确输入。",
+)
+def webgui(
+    host: str = None,
+    port: int = None,
+    storage_secret: str = None,
+    auth_code: str = None,
+):
+    from tg_signer.webui import AUTH_CODE_ENV, main
+
+    if auth_code:
+        os.environ[AUTH_CODE_ENV] = auth_code
+    main(host=host, port=port, storage_secret=storage_secret)

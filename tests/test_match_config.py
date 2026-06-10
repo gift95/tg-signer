@@ -1,8 +1,28 @@
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from tg_signer.config import MatchConfig
+
+
+def make_message(
+    *,
+    chat_id=123,
+    chat_username=None,
+    text="test",
+    from_user=None,
+):
+    user = None
+    if from_user is not None:
+        defaults = {"id": None, "username": None, "is_self": False}
+        defaults.update(from_user)
+        user = SimpleNamespace(**defaults)
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id, username=chat_username),
+        text=text,
+        from_user=user,
+    )
 
 
 class TestMatchConfig:
@@ -27,8 +47,7 @@ class TestMatchConfig:
             rule_value=rule_value,
             from_user_ids=from_user_ids,
         )
-        message = MagicMock()
-        message.from_user = MagicMock(**message_from_user)
+        message = make_message(from_user=message_from_user)
         assert config.match_user(message) == expected
 
     # 测试用例集
@@ -55,7 +74,9 @@ class TestMatchConfig:
     )
     def test_match_text(self, rule, rule_value, text, ignore_case, expected):
         # 构建 MatchConfig 实例
-        config = MatchConfig(rule=rule, rule_value=rule_value, ignore_case=ignore_case)
+        config = MatchConfig(
+            chat_id=123, rule=rule, rule_value=rule_value, ignore_case=ignore_case
+        )
         # 进行匹配测试
         assert config.match_text(text) == expected
 
@@ -109,9 +130,121 @@ class TestMatchConfig:
             default_send_text="default text",
             send_text_search_regex=r"hello",
         )
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ValueError, match="匹配成功但未能捕获关键词") as excinfo:
             config.get_send_text("hello world")
-        assert (
-            str(excinfo.value)
-            == f"{config}: 消息文本: 「hello world」匹配成功但未能捕获关键词, 请检查正则表达式"
+        assert "hello world" in str(excinfo.value)
+
+    def test_get_send_text_with_template_uses_first_capture(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="exact",
+            rule_value="hello",
+            default_send_text="default text",
+            send_text_search_regex=r"参与关键词：「(.*?)」",
+            send_text_template="我要参加：{extracted}",
         )
+
+        assert config.get_send_text("参与关键词：「抽奖」") == "我要参加：抽奖"
+
+    def test_get_send_text_with_template_uses_named_capture(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="exact",
+            rule_value="hello",
+            send_text_search_regex=r"code=(?P<code>\w+)",
+            send_text_template="验证码 {code}",
+        )
+
+        assert config.get_send_text("code=ABC123") == "验证码 ABC123"
+
+    def test_get_send_text_with_template_keeps_unknown_placeholders(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="exact",
+            rule_value="hello",
+            send_text_search_regex=r"hello (\w+)",
+            send_text_template="hello {group1} {missing}",
+        )
+
+        assert config.get_send_text("hello world") == "hello world {missing}"
+
+    def test_get_send_text_with_template_falls_back_when_regex_does_not_match(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="exact",
+            rule_value="hello",
+            default_send_text="default text",
+            send_text_search_regex=r"hello (\w+)",
+            send_text_template="hello {group1}",
+        )
+
+        assert config.get_send_text("goodbye world") == "default text"
+
+    def test_get_send_text_with_template_without_regex_can_use_message_text(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="exact",
+            rule_value="hello",
+            send_text_template="收到：{message_text}",
+        )
+
+        assert config.get_send_text("hello world") == "收到：hello world"
+
+    def test_match_combines_chat_user_and_text(self):
+        config = MatchConfig(
+            chat_id="@target_chat",
+            rule="contains",
+            rule_value="hello",
+            from_user_ids=["@alice"],
+            ignore_case=True,
+        )
+        message = make_message(
+            chat_username="target_chat",
+            text="HELLO WORLD",
+            from_user={"username": "alice"},
+        )
+
+        assert config.match(message) is True
+
+    def test_match_chat_accepts_at_prefixed_username(self):
+        config = MatchConfig(chat_id="@Target_Chat", rule="all")
+        message = make_message(chat_username="target_chat")
+
+        assert config.match_chat(message.chat) is True
+
+    def test_match_config_rejects_missing_chat_id(self):
+        with pytest.raises(ValidationError):
+            MatchConfig(rule="all")
+
+    def test_match_config_rejects_none_chat_id(self):
+        with pytest.raises(ValidationError):
+            MatchConfig(chat_id=None, rule="all")
+
+    def test_match_config_coerces_numeric_string_chat_id_to_int(self):
+        config = MatchConfig(chat_id="-1001234567890", rule="all")
+
+        assert config.chat_id == -1001234567890
+        assert isinstance(config.chat_id, int)
+
+    def test_match_config_rejects_username_without_at_prefix(self):
+        with pytest.raises(ValidationError):
+            MatchConfig(chat_id="target_chat", rule="all")
+
+    def test_match_rejects_self_when_always_ignore_me_enabled(self):
+        config = MatchConfig(
+            chat_id=123,
+            rule="all",
+            from_user_ids=["me"],
+            always_ignore_me=True,
+        )
+        message = make_message(
+            chat_id=123, text="anything", from_user={"is_self": True}
+        )
+
+        assert config.match(message) is False
+
+    def test_match_all_rule_accepts_message_without_sender(self):
+        config = MatchConfig(chat_id=123, rule="all")
+        message = make_message(chat_id=123, text=None, from_user=None)
+
+        assert config.match(message) is True
